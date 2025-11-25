@@ -144,8 +144,8 @@ bool Memory::Initialize() {
   // uncommitted (so it shouldn't expand page file).
   mapping_ = xe::memory::CreateFileMappingHandle(
       file_name_,
-      // entire 4gb space + 512mb physical:
-      0x11FFFFFFF, xe::memory::PageAccess::kReadWrite, false);
+      // entire 4gb space + 1024mb physical:
+      0x13FFFFFFF, xe::memory::PageAccess::kReadWrite, false);
   if (mapping_ == xe::memory::kFileMappingHandleInvalid) {
     XELOGE("Unable to reserve the 4gb guest address space.");
     assert_always();
@@ -310,7 +310,7 @@ static const struct {
     //          - physical raw
     {
         0x100000000,
-        0x11FFFFFFF,
+        0x13FFFFFFF,
         0x0000000100000000ull,
     },
 };
