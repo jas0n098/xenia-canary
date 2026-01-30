@@ -48,12 +48,16 @@ DEFINE_bool(clear_memory_page_state, false,
             "for 'Team Ninja' Games to fix missing character models)",
             "GPU");
 
-DEFINE_bool(
-    readback_resolve, false,
-    "Read render-to-texture results on the CPU. This may be "
-    "needed in some games, for instance, for screenshots in saved games, but "
-    "causes mid-frame synchronization, so it has a huge performance impact.",
+DEFINE_string(
+    readback_resolve, "none",
+    "Controls CPU readback of render-to-texture resolve results.\n"
+    " fast: Read from previous frame (1 frame delay, no GPU stall, slight "
+    "performance hit)\n"
+    " full: Wait for GPU to finish (accurate but slow, GPU-CPU sync stall)\n"
+    " none: Disable readback completely (some games render better without it)",
     "GPU");
+
+UPDATE_from_string(readback_resolve, 2025, 12, 4, 21, "fast");
 
 DEFINE_bool(
     readback_memexport, false,
@@ -73,9 +77,6 @@ void SaveGPUSetting(GPUSetting setting, uint64_t value) {
     case GPUSetting::ClearMemoryPageState:
       OVERRIDE_bool(clear_memory_page_state, static_cast<bool>(value));
       break;
-    case GPUSetting::ReadbackResolve:
-      OVERRIDE_bool(readback_resolve, static_cast<bool>(value));
-      break;
     case GPUSetting::ReadbackMemexport:
       OVERRIDE_bool(readback_memexport, static_cast<bool>(value));
       break;
@@ -86,12 +87,26 @@ bool GetGPUSetting(GPUSetting setting) {
   switch (setting) {
     case GPUSetting::ClearMemoryPageState:
       return cvars::clear_memory_page_state;
-    case GPUSetting::ReadbackResolve:
-      return cvars::readback_resolve;
     case GPUSetting::ReadbackMemexport:
       return cvars::readback_memexport;
   }
   return false;
+}
+
+ReadbackResolveMode GetReadbackResolveMode() {
+  const std::string& mode = cvars::readback_resolve;
+  if (mode == "full") {
+    return ReadbackResolveMode::kFull;
+  } else if (mode == "none") {
+    return ReadbackResolveMode::kDisabled;
+  } else {
+    // Default to "fast" for any unrecognized value
+    return ReadbackResolveMode::kFast;
+  }
+}
+
+void SetReadbackResolveMode(const std::string& mode) {
+  OVERRIDE_string(readback_resolve, mode);
 }
 
 using namespace xe::gpu::xenos;

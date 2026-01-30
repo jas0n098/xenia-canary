@@ -133,6 +133,9 @@ struct X_XAMACCOUNTINFO {
 };
 static_assert_size(X_XAMACCOUNTINFO, 0x17C);
 
+#define X_USER_GET_SIGNIN_INFO_ONLINE_XUID_ONLY 0x00000001
+#define X_USER_GET_SIGNIN_INFO_OFFLINE_XUID_ONLY 0x00000002
+
 #define MAX_FIRSTNAME_SIZE 64
 #define MAX_LASTNAME_SIZE 64
 #define MAX_EMAIL_SIZE 129
@@ -218,6 +221,22 @@ struct X_PASSPORT_SESSION_TOKEN {
 static_assert_size(X_PASSPORT_SESSION_TOKEN, 0x1C);
 
 #pragma pack(pop)
+
+struct X_USER_SIGNIN_INFO {
+  xe::be<uint64_t> xuid;
+  xe::be<uint32_t> flags;
+  xe::be<uint32_t> signin_state;
+  xe::be<uint32_t> guest_num;
+  xe::be<uint32_t> sponsor_user_index;
+  char name[16];
+};
+static_assert_size(X_USER_SIGNIN_INFO, 40);
+
+struct X_USER_READ_PROFILE_SETTINGS {
+  xe::be<uint32_t> setting_count;
+  xe::be<uint32_t> settings_ptr;
+};
+static_assert_size(X_USER_READ_PROFILE_SETTINGS, 8);
 
 // clang-format off
 #define XMBox_NOICON                0x00000000
@@ -328,6 +347,26 @@ enum class UserContextDevice : uint32_t {
   BigButton = 3,
   Microphone = 4,
 };
+
+constexpr uint32_t XMP_MAX_METADATA_STRING = 40;
+constexpr uint32_t XMP_MAX_USER_PLAYLIST_ID = 572;
+constexpr uint32_t XMP_USER_PLAYLIST_RESERVED_FIELD_SIZE = 168;
+
+struct XMP_USER_PLAYLIST_INFO {
+  uint8_t id[XMP_MAX_USER_PLAYLIST_ID];
+  xe::be<char16_t> title[XMP_MAX_METADATA_STRING];
+  uint8_t reserved[XMP_USER_PLAYLIST_RESERVED_FIELD_SIZE];
+};
+static_assert_size(XMP_USER_PLAYLIST_INFO, 0x334);
+
+constexpr uint8_t kStatsMaxAmount = 64;
+
+struct X_STATS_DETAILS {
+  xe::be<uint32_t> id;
+  xe::be<uint32_t> stats_amount;
+  xe::be<uint16_t> stats[kStatsMaxAmount];
+};
+static_assert_size(X_STATS_DETAILS, 8 + kStatsMaxAmount * 2);
 
 }  // namespace xam
 }  // namespace kernel

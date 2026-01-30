@@ -75,12 +75,14 @@ struct XMA_CONTEXT_DATA {
 
   // DWORD 2
   uint32_t input_buffer_read_offset : 26;  // XMAGetInputBufferReadOffset
-  uint32_t error_status : 6;               // ErrorStatus/ErrorSet (?)
+  uint32_t error_status : 5;               // ErrorStatus
+  uint32_t error_set : 1;                  // ErrorSet
 
   // DWORD 3
   uint32_t loop_start : 26;          // XMASetLoopData LoopStartOffset
                                      // frame offset in bits
-  uint32_t parser_error_status : 6;  // ? ParserErrorStatus/ParserErrorSet(?)
+  uint32_t parser_error_status : 5;  // ParserErrorStatus
+  uint32_t parser_error_set : 1;     // ParserErrorSet
 
   // DWORD 4
   uint32_t loop_end : 26;        // XMASetLoopData LoopEndOffset
@@ -146,6 +148,12 @@ struct XMA_CONTEXT_DATA {
   const uint32_t GetCurrentInputBufferPacketCount() const {
     return GetInputBufferPacketCount(current_buffer);
   }
+  const bool IsStreamingContext() const {
+    return (input_buffer_0_packet_count | input_buffer_1_packet_count) == 1;
+  }
+  const bool IsConsumeOnlyContext() const {
+    return (input_buffer_0_packet_count | input_buffer_1_packet_count) == 0;
+  }
 };
 static_assert_size(XMA_CONTEXT_DATA, 64);
 
@@ -160,8 +168,13 @@ static_assert_size(Xma2ExtraData, 34);
 class XmaContext {
  public:
   static constexpr uint32_t kBytesPerPacket = 2048;
+  static constexpr uint32_t kBytesPerPacketHeader = 4;
+  static constexpr uint32_t kBytesPerPacketData =
+      kBytesPerPacket - kBytesPerPacketHeader;
+
   static constexpr uint32_t kBitsPerPacket = kBytesPerPacket * 8;
   static constexpr uint32_t kBitsPerHeader = 32;
+  static constexpr uint32_t kBitsPerFrameHeader = 15;
 
   static constexpr uint32_t kBytesPerSample = 2;
   static constexpr uint32_t kSamplesPerFrame = 512;
@@ -171,8 +184,10 @@ class XmaContext {
   static constexpr uint32_t kBytesPerSubframeChannel =
       kSamplesPerSubframe * kBytesPerSample;
 
-  // static const uint32_t kOutputBytesPerBlock = 256;
-  // static const uint32_t kOutputMaxSizeBytes = 31 * kOutputBytesPerBlock;
+  static constexpr uint32_t kOutputBytesPerBlock = 256;
+  static constexpr uint32_t kOutputMaxSizeBytes = 31 * kOutputBytesPerBlock;
+
+  static constexpr uint32_t kLastFrameMarker = 0x7FFF;
 
   explicit XmaContext();
   virtual ~XmaContext();

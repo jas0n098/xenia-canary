@@ -14,6 +14,7 @@
 
 #include "xenia/kernel/xam/achievement_manager.h"
 #include "xenia/kernel/xam/user_tracker.h"
+#include "xenia/kernel/xam/xam.h"
 #include "xenia/kernel/xobject.h"
 
 namespace xe {
@@ -84,15 +85,17 @@ class XEnumerator : public XObject {
     return result;
   }
 
-  virtual uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data,
+  virtual uint32_t WriteItems(uint8_t* buffer_data, uint32_t buffer_size,
                               uint32_t* written_count) = 0;
 
   size_t item_size() const { return item_size_; }
   size_t items_per_enumerate() const { return items_per_enumerate_; }
+  size_t extra_size() const { return extra_size_; }
 
  private:
   size_t items_per_enumerate_;
   size_t item_size_;
+  size_t extra_size_;
 };
 
 class XStaticUntypedEnumerator : public XEnumerator {
@@ -107,7 +110,7 @@ class XStaticUntypedEnumerator : public XEnumerator {
 
   uint8_t* AppendItem();
 
-  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data,
+  uint32_t WriteItems(uint8_t* buffer_data, uint32_t buffer_size,
                       uint32_t* written_count) override;
 
  private:
@@ -136,42 +139,40 @@ class XStaticEnumerator : public XStaticUntypedEnumerator {
 class XAchievementEnumerator : public XEnumerator {
  public:
   XAchievementEnumerator(KernelState* kernel_state, size_t items_per_enumerate,
-                         uint32_t flags)
+                         size_t enumeration_offset, uint32_t flags)
       : XEnumerator(
             kernel_state, items_per_enumerate,
             sizeof(xam::X_ACHIEVEMENT_DETAILS) +
                 (!!(flags & 7) ? xam::X_ACHIEVEMENT_DETAILS::kStringBufferSize
                                : 0)),
+        current_item_(enumeration_offset),
         flags_(flags) {}
 
   void AppendItem(xam::AchievementDetails item) {
     items_.push_back(std::move(item));
   }
 
-  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data,
+  uint32_t WriteItems(uint8_t* buffer_data, uint32_t buffer_size,
                       uint32_t* written_count) override;
 
  private:
   struct StringBuffer {
-    uint32_t ptr;
     uint8_t* data;
     size_t remaining_bytes;
   };
 
   uint32_t AppendString(StringBuffer& sb, const std::u16string_view string) {
-    size_t count = string.length() + 1;
-    size_t size = count * sizeof(char16_t);
+    const size_t count = string.length() + 1;
+    const size_t size = count * sizeof(char16_t);
     if (size > sb.remaining_bytes) {
       assert_always();
       return 0;
     }
-    auto ptr = sb.ptr;
     string_util::copy_and_swap_truncating(reinterpret_cast<char16_t*>(sb.data),
                                           string, count);
-    sb.ptr += static_cast<uint32_t>(size);
     sb.data += size;
     sb.remaining_bytes -= size;
-    return ptr;
+    return static_cast<uint32_t>(reinterpret_cast<uintptr_t>(sb.data - size));
   }
 
  private:
@@ -192,7 +193,7 @@ class XTitleEnumerator : public XEnumerator {
 
   void AppendItem(const xam::TitleInfo& item) { items_.push_back(item); }
 
-  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data,
+  uint32_t WriteItems(uint8_t* buffer_data, uint32_t buffer_size,
                       uint32_t* written_count) override;
 
  private:
@@ -211,11 +212,31 @@ class XUserStatsEnumerator : public XEnumerator {
   XUserStatsEnumerator(KernelState* kernel_state, size_t items_per_enumerate)
       : XEnumerator(kernel_state, items_per_enumerate, 0) {}
 
-  uint32_t WriteItems(uint32_t buffer_ptr, uint8_t* buffer_data,
+  uint32_t WriteItems(uint8_t* buffer_data, uint32_t buffer_size,
                       uint32_t* written_count) override;
 
  private:
   std::vector<XUSER_STATS_SPEC> items_;
+  size_t current_item_ = 0;
+};
+
+class XMPCreateUserPlaylistEnumerator : public XEnumerator {
+ public:
+  XMPCreateUserPlaylistEnumerator(KernelState* kernel_state,
+                                  size_t items_per_enumerate)
+      : XEnumerator(kernel_state, items_per_enumerate, 0) {}
+
+  size_t item_count() const { return items_.size(); }
+
+  void AppendItem(const xam::XMP_USER_PLAYLIST_INFO& item) {
+    items_.push_back(item);
+  }
+
+  uint32_t WriteItems(uint8_t* buffer_data, uint32_t buffer_size,
+                      uint32_t* written_count) override;
+
+ private:
+  std::vector<xam::XMP_USER_PLAYLIST_INFO> items_;
   size_t current_item_ = 0;
 };
 

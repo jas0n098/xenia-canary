@@ -33,6 +33,9 @@ namespace toml_internal {
 std::string EscapeString(const std::string_view str);
 }
 
+// Track config values that had type mismatches during loading
+extern std::vector<std::string>* config_type_mismatch_warnings;
+
 class ICommandVar {
  public:
   virtual ~ICommandVar() = default;
@@ -147,7 +150,16 @@ inline void CommandVar<std::filesystem::path>::LoadFromLaunchOptions(
 }
 template <class T>
 void ConfigVar<T>::LoadConfigValue(const toml::node* result) {
-  SetConfigValue(result->value<T>().value());
+  auto value_opt = result->value<T>();
+  if (value_opt) {
+    SetConfigValue(value_opt.value());
+  } else {
+    // Type mismatch - track for warning
+    if (!config_type_mismatch_warnings) {
+      config_type_mismatch_warnings = new std::vector<std::string>();
+    }
+    config_type_mismatch_warnings->push_back(this->name_);
+  }
 }
 template <>
 inline void ConfigVar<std::filesystem::path>::LoadConfigValue(
@@ -157,7 +169,16 @@ inline void ConfigVar<std::filesystem::path>::LoadConfigValue(
 }
 template <class T>
 void ConfigVar<T>::LoadGameConfigValue(const toml::node* result) {
-  SetGameConfigValue(result->value<T>().value());
+  auto value_opt = result->value<T>();
+  if (value_opt) {
+    SetGameConfigValue(value_opt.value());
+  } else {
+    // Type mismatch - track for warning
+    if (!config_type_mismatch_warnings) {
+      config_type_mismatch_warnings = new std::vector<std::string>();
+    }
+    config_type_mismatch_warnings->push_back(this->name_);
+  }
 }
 template <>
 inline void ConfigVar<std::filesystem::path>::LoadGameConfigValue(
@@ -490,7 +511,7 @@ class IConfigVarUpdate {
   // If you're reviewing a pull request with a change here, check if 1) has been
   // done by the submitter before merging.
   static constexpr uint32_t kLastCommittedUpdateDate =
-      MakeConfigVarUpdateDate(2024, 9, 23, 9);
+      MakeConfigVarUpdateDate(2025, 12, 4, 21);
 
   virtual ~IConfigVarUpdate() = default;
 

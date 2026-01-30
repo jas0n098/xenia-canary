@@ -10,6 +10,8 @@
 #include "xenia/apu/xma_decoder.h"
 
 #include "xenia/apu/xma_context.h"
+#include "xenia/apu/xma_context_fake.h"
+#include "xenia/apu/xma_context_master.h"
 #include "xenia/apu/xma_context_new.h"
 #include "xenia/apu/xma_context_old.h"
 
@@ -54,13 +56,22 @@ extern "C" {
 DEFINE_bool(ffmpeg_verbose, false, "Verbose FFmpeg output (debug and above)",
             "APU");
 
-DEFINE_bool(use_new_decoder, false,
-            "Enables usage of new experimental XMA audio decoder.", "APU");
-
 DEFINE_bool(use_dedicated_xma_thread, true,
             "Enables XMA decoding on separate thread. Disabled should produce "
             "better results, but decrease performance a bit.",
             "APU");
+
+DEFINE_string(
+    xma_decoder, "new",
+    "Decoder version used to process XMA audio.\n"
+    "Use: [fake, master, old, new]\n"
+    " fake: \n  No audio will be decoded.\n"
+    " master: \n  Version of decoder exactly like on base version of Xenia.\n"
+    " old: \n  Decoder based on master version of decoder with few "
+    "improvements.\n"
+    " new: \n  New version of decoder. Provides highest stability, but isn't "
+    "yet finished.\n",
+    "APU");
 
 namespace xe {
 namespace apu {
@@ -139,10 +150,16 @@ X_STATUS XmaDecoder::Setup(kernel::KernelState* kernel_state) {
 
   // Setup XMA contexts.
   for (int i = 0; i < kContextCount; ++i) {
-    if (cvars::use_new_decoder) {
+    if (cvars::xma_decoder == "fake") {
+      contexts_[i] = new XmaContextFake();
+    } else if (cvars::xma_decoder == "master") {
+      contexts_[i] = new XmaContextMaster();
+    } else if (cvars::xma_decoder == "old") {
+      contexts_[i] = new XmaContextOld();
+    } else if (cvars::xma_decoder == "new") {
       contexts_[i] = new XmaContextNew();
     } else {
-      contexts_[i] = new XmaContextOld();
+      contexts_[i] = new XmaContextNew();
     }
 
     uint32_t guest_ptr = context_data_first_ptr_ + i * sizeof(XMA_CONTEXT_DATA);
@@ -322,16 +339,15 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     // XMAEnableContext
 
     // The context ID is a bit in the range of the entire context array.
-    uint32_t base_context_id = (r - XmaRegister::Context0Kick) * 32;
-    for (int i = 0; value && i < 32; ++i, value >>= 1) {
-      if (value & 1) {
-        uint32_t context_id = base_context_id + i;
-        auto& context = *contexts_[context_id];
-        context.Enable();
-        if (!cvars::use_dedicated_xma_thread) {
-          context.Work();
-        }
+    const uint32_t base_context_id = (r - XmaRegister::Context0Kick) * 32;
+    while (value) {
+      const uint32_t context_id = base_context_id + std::countr_zero(value);
+      auto& context = *contexts_[context_id];
+      context.Enable();
+      if (!cvars::use_dedicated_xma_thread) {
+        context.Work();
       }
+      value &= value - 1;
     }
     // Signal the decoder thread to start processing.
     work_event_->SetBoostPriority();
@@ -339,27 +355,26 @@ void XmaDecoder::WriteRegister(uint32_t addr, uint32_t value) {
     // Context lock command.
     // This requests a lock by flagging the context.
     // XMADisableContext
-    uint32_t base_context_id = (r - XmaRegister::Context0Lock) * 32;
-    for (int i = 0; value && i < 32; ++i, value >>= 1) {
-      if (value & 1) {
-        uint32_t context_id = base_context_id + i;
-        auto& context = *contexts_[context_id];
-        context.Disable();
-      }
+    const uint32_t base_context_id = (r - XmaRegister::Context0Lock) * 32;
+    while (value) {
+      const uint32_t context_id = base_context_id + std::countr_zero(value);
+      auto& context = *contexts_[context_id];
+      context.Disable();
+      value &= value - 1;
     }
+
     // Signal the decoder thread to start processing.
     // work_event_->Set();
   } else if (r >= XmaRegister::Context0Clear &&
              r <= XmaRegister::Context9Clear) {
     // Context clear command.
     // This will reset the given hardware contexts.
-    uint32_t base_context_id = (r - XmaRegister::Context0Clear) * 32;
-    for (int i = 0; value && i < 32; ++i, value >>= 1) {
-      if (value & 1) {
-        uint32_t context_id = base_context_id + i;
-        XmaContext& context = *contexts_[context_id];
-        context.Clear();
-      }
+    const uint32_t base_context_id = (r - XmaRegister::Context0Clear) * 32;
+    while (value) {
+      const uint32_t context_id = base_context_id + std::countr_zero(value);
+      auto& context = *contexts_[context_id];
+      context.Clear();
+      value &= value - 1;
     }
   } else {
     // 0601h (1804h) is written to with 0x02000000 and 0x03000000 around a lock

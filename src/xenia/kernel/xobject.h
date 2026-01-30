@@ -48,6 +48,7 @@ typedef struct {
     union {
       uint8_t size;
       uint8_t hand;
+      uint8_t process_type;
     };
     union {
       uint8_t inserted;
@@ -286,8 +287,8 @@ class object_ref {
     reset(right.get());
     if (value_) value_->Retain();
   }
-  template <class V, class = typename std::enable_if<
-                         std::is_convertible<V*, T*>::value, void>::type>
+  template <class V>
+    requires std::is_convertible_v<V*, T*>
   object_ref(const object_ref<V>& right) noexcept {
     reset(right.get());
     if (value_) value_->Retain();
@@ -379,8 +380,8 @@ bool operator!=(std::nullptr_t _Left, const object_ref<_Ty>& _Right) noexcept {
 }
 
 template <class T, class... Args>
-std::enable_if_t<!std::is_array<T>::value, object_ref<T>> make_object(
-    Args&&... args) {
+  requires(!std::is_array_v<T>)
+object_ref<T> make_object(Args&&... args) {
   return object_ref<T>(new T(std::forward<Args>(args)...));
 }
 

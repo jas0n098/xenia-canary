@@ -33,6 +33,10 @@ DEFINE_bool(
     "may be used to bypass fetch constant type errors in certain games until "
     "the real reason why they're invalid is found.",
     "GPU");
+DEFINE_bool(
+    gpu_allow_invalid_upload_range, false,
+    "Allows games to read data from pages that are marked as no access.",
+    "GPU");
 
 DEFINE_bool(
     non_seamless_cube_map, true,
@@ -66,3 +70,15 @@ DEFINE_int32(
     "Set to higher number than query_occlusion_sample_lower_threshold. This "
     "value is ignored if query_occlusion_sample_lower_threshold is set to -1.",
     "GPU");
+
+DEFINE_int32(anisotropic_override, -1,
+             "Level of anisotropic filtering enforced on all texture fetch "
+             "instructions.\n"
+             " -1 = No override\n"
+             "  0 = Disable anisotropic filtering\n"
+             "  1 = Force 1x anisotropic filtering\n"
+             "  2 = Force 2x anisotropic filtering\n"
+             "  3 = Force 4x anisotropic filtering\n"
+             "  4 = Force 8x anisotropic filtering\n"
+             "  5 = Force 16x anisotropic filtering",
+             "GPU");
