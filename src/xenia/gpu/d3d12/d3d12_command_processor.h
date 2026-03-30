@@ -37,6 +37,7 @@
 #include "xenia/kernel/kernel_state.h"
 #include "xenia/kernel/user_module.h"
 #include "xenia/ui/d3d12/d3d12_descriptor_heap_pool.h"
+#include "xenia/ui/d3d12/d3d12_gpu_completion_timeline.h"
 #include "xenia/ui/d3d12/d3d12_provider.h"
 #include "xenia/ui/d3d12/d3d12_upload_buffer_pool.h"
 #include "xenia/ui/d3d12/d3d12_util.h"
@@ -67,8 +68,9 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   void ClearCaches() override;
 
-  void InitializeShaderStorage(const std::filesystem::path& cache_root,
-                               uint32_t title_id, bool blocking) override;
+  void InitializeShaderStorage(
+      const std::filesystem::path& cache_root, uint32_t title_id, bool blocking,
+      std::function<void()> completion_callback = nullptr) override;
 
   void RequestFrameTrace(const std::filesystem::path& root_path) override;
 
@@ -88,12 +90,16 @@ class D3D12CommandProcessor final : public CommandProcessor {
     return deferred_command_list_;
   }
 
-  uint64_t GetCurrentSubmission() const { return submission_current_; }
-  uint64_t GetCompletedSubmission() const { return submission_completed_; }
+  uint64_t GetCurrentSubmission() const {
+    return completion_timeline_->GetUpcomingSubmission();
+  }
+  uint64_t GetCompletedSubmission() const {
+    return completion_timeline_->GetCompletedSubmissionFromLastUpdate();
+  }
 
   // Must be called when a subsystem does something like UpdateTileMappings so
-  // it can be awaited in CheckSubmissionFence(submission_current_) if it was
-  // done after the latest ExecuteCommandLists + Signal.
+  // it can be awaited in CheckSubmissionCompletion(GetCurrentSubmission()) if
+  // it was done after the latest ExecuteCommandLists + Signal.
   void NotifyQueueOperationsDoneDirectly() {
     queue_operations_done_since_submission_signal_ = true;
   }
@@ -155,13 +161,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
     kNullRawSRV = kNullRawSRVAndSharedMemoryRawUAVStart,
     kSharedMemoryRawUAV,
 
-    kSharedMemoryR32UintSRV,
-    kSharedMemoryR32G32UintSRV,
-    kSharedMemoryR32G32B32A32UintSRV,
-    kSharedMemoryR32UintUAV,
-    kSharedMemoryR32G32UintUAV,
-    kSharedMemoryR32G32B32A32UintUAV,
-
     kEdramRawSRV,
     kEdramR32UintSRV,
     kEdramR32G32UintSRV,
@@ -186,12 +185,6 @@ class D3D12CommandProcessor final : public CommandProcessor {
   };
   ui::d3d12::util::DescriptorCpuGpuHandlePair GetSystemBindlessViewHandlePair(
       SystemBindlessView view) const;
-  ui::d3d12::util::DescriptorCpuGpuHandlePair
-  GetSharedMemoryUintPow2BindlessSRVHandlePair(
-      uint32_t element_size_bytes_pow2) const;
-  ui::d3d12::util::DescriptorCpuGpuHandlePair
-  GetSharedMemoryUintPow2BindlessUAVHandlePair(
-      uint32_t element_size_bytes_pow2) const;
   ui::d3d12::util::DescriptorCpuGpuHandlePair
   GetEdramUintPow2BindlessSRVHandlePair(uint32_t element_size_bytes_pow2) const;
   ui::d3d12::util::DescriptorCpuGpuHandlePair
@@ -417,9 +410,9 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // decay.
 
   // Rechecks submission number and reclaims per-submission resources. Pass 0 as
-  // the submission to await to simply check status, or pass submission_current_
-  // to wait for all queue operations to be completed.
-  void CheckSubmissionFence(uint64_t await_submission);
+  // the submission to await to simply check status, or pass
+  // GetCurrentSubmission() to wait for all queue operations to be completed.
+  void CheckSubmissionCompletion(uint64_t await_submission);
   // If is_guest_command is true, a new full frame - with full cleanup of
   // resources and, if needed, starting capturing - is opened if pending (as
   // opposed to simply resuming after mid-frame synchronization). Returns
@@ -435,8 +428,8 @@ class D3D12CommandProcessor final : public CommandProcessor {
   // need to be fulfilled before actually submitting the command list.
   bool CanEndSubmissionImmediately() const;
   bool AwaitAllQueueOperationsCompletion() {
-    CheckSubmissionFence(submission_current_);
-    return submission_completed_ + 1 >= submission_current_;
+    CheckSubmissionCompletion(GetCurrentSubmission());
+    return GetCompletedSubmission() + 1u >= GetCurrentSubmission();
   }
   // Need to await submission completion before calling.
   void ClearCommandAllocatorCache();
@@ -502,20 +495,15 @@ class D3D12CommandProcessor final : public CommandProcessor {
 
   bool cache_clear_requested_ = false;
 
-  HANDLE fence_completion_event_ = nullptr;
-
+  std::unique_ptr<ui::d3d12::D3D12GPUCompletionTimeline> completion_timeline_;
   bool submission_open_ = false;
-  // Values of submission_fence_.
-  uint64_t submission_current_ = 1;
-  uint64_t submission_completed_ = 0;
-  ID3D12Fence* submission_fence_ = nullptr;
 
   // For awaiting non-submission queue operations such as UpdateTileMappings in
   // AwaitAllQueueOperationsCompletion when they're queued after the latest
   // ExecuteCommandLists + Signal, thus won't be awaited by just awaiting the
   // submission.
-  ID3D12Fence* queue_operations_since_submission_fence_ = nullptr;
-  uint64_t queue_operations_since_submission_fence_last_ = 0;
+  std::unique_ptr<ui::d3d12::D3D12GPUCompletionTimeline>
+      queue_operations_since_submission_completion_timeline_;
   bool queue_operations_done_since_submission_signal_ = false;
 
   bool frame_open_ = false;

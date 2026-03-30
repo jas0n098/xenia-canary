@@ -13,6 +13,7 @@
 #include <cstring>
 
 #include "xenia/cpu/backend/x64/x64_op.h"
+#include "xenia/cpu/backend/x64/x64_util.h"
 
 // For OPCODE_PACK/OPCODE_UNPACK
 #include "third_party/half/include/half.hpp"
@@ -101,13 +102,12 @@ struct VECTOR_CONVERT_F2I
     if (i.instr->flags & ARITHMETIC_UNSIGNED) {
       if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
         Opmask mask = e.k1;
-        // Mask positive values and unordered values
-        // _CMP_NLT_UQ
-        e.vcmpps(mask, i.src1, e.GetXmmConstPtr(XMMZero), 0x15);
+        // Mask non-negative, non-NaN values (ordered, >= 0)
+        // _CMP_GE_OQ
+        e.vcmpps(mask, i.src1, e.GetXmmConstPtr(XMMZero), 0x1D);
 
-        // vcvttps2udq will saturate overflowing positive values and unordered
-        // values to UINT_MAX. Mask registers will write zero everywhere
-        // else (negative values)
+        // vcvttps2udq will saturate overflowing positive values to UINT_MAX.
+        // Zero-masking writes zero for negative values and NaN
         e.vcvttps2udq(i.dest.reg() | mask | e.T_z, i.src1);
         return;
       }
@@ -160,6 +160,17 @@ struct VECTOR_DENORMFLUSH
     : Sequence<VECTOR_DENORMFLUSH,
                I<OPCODE_VECTOR_DENORMFLUSH, V128Op, V128Op>> {
   static void Emit(X64Emitter& e, const EmitArgType& i) {
+    if (e.IsFeatureEnabled(kX64EmitAVX512Ortho | kX64EmitAVX512DQ)) {
+      const Xbyak::Opmask denormal_mask = e.k1;
+      e.vptestnmd(denormal_mask, i.src1,
+                  e.GetXmmConstPtr(XMMSingleDenormalMask));
+      e.vxorps(e.xmm1, e.xmm1, e.xmm1);
+      e.vmovaps(i.dest, i.src1);
+      e.vrangeps(i.dest.reg() | denormal_mask, i.dest, e.xmm1,
+                 FpRangeSelect::AbsMin | FpRangeSign::OperandA);
+      return;
+    }
+
     e.ChangeMxcsrMode(MXCSRMode::Vmx);
     e.vxorps(e.xmm1, e.xmm1, e.xmm1);  // 0.25 P0123
 
@@ -672,11 +683,11 @@ struct VECTOR_ADD
               if (saturate) {
                 if (is_unsigned) {
                   if (e.IsFeatureEnabled(kX64EmitAVX512Ortho)) {
-                    e.vpaddd(dest, src1, src2);
-                    Opmask saturate = e.k1;
-                    // _mm_cmplt_epu32_mask
-                    e.vpcmpud(saturate, dest, src1, 0x1);
-                    e.vpternlogd(dest | saturate, dest, dest, 0xFF);
+                    e.vpaddd(e.xmm1, src1, src2);
+                    Opmask no_overflow = e.k1;
+                    e.vpcmpud(no_overflow, e.xmm1, src1, 0x5);
+                    e.vpcmpeqd(dest, dest, dest);
+                    e.vmovdqa32(dest | no_overflow, e.xmm1);
                     return;
                   }
 
@@ -935,6 +946,11 @@ struct VECTOR_SHL_V128
         e.vpmovzxbd(e.ymm2, i.src2);
         e.vpmovzxbd(e.ymm3, e.xmm3);
 
+        // Mask shift counts to 3 bits (0-7) for byte shifts
+        e.vpbroadcastd(e.ymm4, e.GetXmmConstPtr(XMMXOPByteShiftMask));
+        e.vpand(e.ymm2, e.ymm2, e.ymm4);
+        e.vpand(e.ymm3, e.ymm3, e.ymm4);
+
         e.vpsllvd(e.ymm0, e.ymm0, e.ymm2);
         e.vpsllvd(e.ymm1, e.ymm1, e.ymm3);
         e.vextracti128(e.xmm2, e.ymm0, 1);
@@ -944,9 +960,9 @@ struct VECTOR_SHL_V128
         e.vpshufb(e.xmm2, e.xmm2, e.GetXmmConstPtr(XMMIntsToBytes));
         e.vpshufb(e.xmm3, e.xmm3, e.GetXmmConstPtr(XMMIntsToBytes));
 
-        e.vpunpckldq(e.xmm0, e.xmm0, e.xmm1);
-        e.vpunpckldq(e.xmm2, e.xmm2, e.xmm3);
-        e.vpunpcklqdq(i.dest, e.xmm0, e.xmm2);
+        e.vpunpckldq(e.xmm0, e.xmm0, e.xmm2);
+        e.vpunpckldq(e.xmm1, e.xmm1, e.xmm3);
+        e.vpunpcklqdq(i.dest, e.xmm0, e.xmm1);
         return;
       } else {
         vec128_t constmask = i.src2.constant();
@@ -985,6 +1001,10 @@ struct VECTOR_SHL_V128
           e.vpmovzxbd(e.ymm2, e.xmm2);
           e.vpmovzxbd(e.ymm3, e.xmm3);
 
+          e.vpbroadcastd(e.ymm4, e.GetXmmConstPtr(XMMXOPByteShiftMask));
+          e.vpand(e.ymm2, e.ymm2, e.ymm4);
+          e.vpand(e.ymm3, e.ymm3, e.ymm4);
+
           e.vpsllvd(e.ymm0, e.ymm0, e.ymm2);
           e.vpsllvd(e.ymm1, e.ymm1, e.ymm3);
           e.vextracti128(e.xmm2, e.ymm0, 1);
@@ -994,9 +1014,9 @@ struct VECTOR_SHL_V128
           e.vpshufb(e.xmm2, e.xmm2, e.GetXmmConstPtr(XMMIntsToBytes));
           e.vpshufb(e.xmm3, e.xmm3, e.GetXmmConstPtr(XMMIntsToBytes));
 
-          e.vpunpckldq(e.xmm0, e.xmm0, e.xmm1);
-          e.vpunpckldq(e.xmm2, e.xmm2, e.xmm3);
-          e.vpunpcklqdq(i.dest, e.xmm0, e.xmm2);
+          e.vpunpckldq(e.xmm0, e.xmm0, e.xmm2);
+          e.vpunpckldq(e.xmm1, e.xmm1, e.xmm3);
+          e.vpunpcklqdq(i.dest, e.xmm0, e.xmm1);
 
           return;
         }
@@ -1025,6 +1045,7 @@ struct VECTOR_SHL_V128
 
     e.L(looper);
     e.movzx(e.ecx, e.byte[e.rsp + stack_offset_src2 + e.rdx]);
+    e.and_(e.cl, 7);  // Mask shift count to 3 bits (0-7) for byte shifts
 
     e.shl(e.byte[e.rsp + stack_offset_src1 + e.rdx], e.cl);
 
@@ -1050,7 +1071,7 @@ struct VECTOR_SHL_V128
     if (i.src2.is_constant) {
       const auto& shamt = i.src2.constant();
       bool all_same = true;
-      for (size_t n = 0; n < 8 - n; ++n) {
+      for (size_t n = 0; n < 7; ++n) {
         if (shamt.u16[n] != shamt.u16[n + 1]) {
           all_same = false;
           break;
@@ -1103,6 +1124,7 @@ struct VECTOR_SHL_V128
 
     e.L(looper);
     e.movzx(e.ecx, e.word[e.rsp + stack_offset_src2 + e.rdx]);
+    e.and_(e.cl, 0xF);  // Mask shift count to 4 bits (0-15) for word shifts
 
     e.shl(e.word[e.rsp + stack_offset_src1 + e.rdx], e.cl);
 
@@ -1127,7 +1149,7 @@ struct VECTOR_SHL_V128
     if (i.src2.is_constant) {
       const auto& shamt = i.src2.constant();
       bool all_same = true;
-      for (size_t n = 0; n < 4 - n; ++n) {
+      for (size_t n = 0; n < 3; ++n) {
         if (shamt.u32[n] != shamt.u32[n + 1]) {
           all_same = false;
           break;
@@ -1197,6 +1219,7 @@ struct VECTOR_SHL_V128
 
       e.L(looper);
       e.mov(e.ecx, e.dword[e.rsp + stack_offset_src2 + e.rdx]);
+      e.and_(e.cl, 0x1F);  // Mask shift count to 5 bits (0-31) for dword shifts
 
       e.shl(e.dword[e.rsp + stack_offset_src1 + e.rdx], e.cl);
 
@@ -1305,6 +1328,7 @@ struct VECTOR_SHR_V128
     // movzx is to eliminate any possible dep on previous value of rcx at start
     // of loop
     e.movzx(e.ecx, e.byte[e.rsp + stack_offset_src2 + e.rdx]);
+    e.and_(e.cl, 7);  // Mask shift count to 3 bits (0-7) for byte shifts
     // maybe using a memory operand as the left side isn't the best idea lol,
     // still better than callnativesafe though agners docs have no timing info
     // on shx [m], cl so shrug
@@ -1325,7 +1349,7 @@ struct VECTOR_SHR_V128
     if (i.src2.is_constant) {
       const auto& shamt = i.src2.constant();
       bool all_same = true;
-      for (size_t n = 0; n < 8 - n; ++n) {
+      for (size_t n = 0; n < 7; ++n) {
         if (shamt.u16[n] != shamt.u16[n + 1]) {
           all_same = false;
           break;
@@ -1384,7 +1408,7 @@ struct VECTOR_SHR_V128
 
     e.L(looper);
     e.movzx(e.ecx, e.word[e.rsp + stack_offset_src2 + e.rdx]);
-
+    e.and_(e.cl, 0xF);  // Mask shift count to 4 bits (0-15) for word shifts
     e.shr(e.word[e.rsp + stack_offset_src1 + e.rdx], e.cl);
 
     e.add(e.edx, 2);
@@ -1408,7 +1432,7 @@ struct VECTOR_SHR_V128
     if (i.src2.is_constant) {
       const auto& shamt = i.src2.constant();
       bool all_same = true;
-      for (size_t n = 0; n < 4 - n; ++n) {
+      for (size_t n = 0; n < 3; ++n) {
         if (shamt.u32[n] != shamt.u32[n + 1]) {
           all_same = false;
           break;
@@ -1484,6 +1508,7 @@ struct VECTOR_SHR_V128
 
       e.L(looper);
       e.mov(e.ecx, e.dword[e.rsp + stack_offset_src2 + e.rdx]);
+      e.and_(e.cl, 0x1F);  // Mask shift count to 5 bits (0-31) for dword shifts
       e.shr(e.dword[e.rsp + stack_offset_src1 + e.rdx], e.cl);
 
       e.add(e.edx, 4);
@@ -1604,6 +1629,7 @@ struct VECTOR_SHA_V128
     // movzx is to eliminate any possible dep on previous value of rcx at start
     // of loop
     e.movzx(e.ecx, e.byte[e.rsp + stack_offset_src2 + e.rdx]);
+    e.and_(e.cl, 7);  // Mask shift count to 3 bits (0-7) for byte shifts
     // maybe using a memory operand as the left side isn't the best idea lol,
     // still better than callnativesafe though agners docs have no timing info
     // on shx [m], cl so shrug
@@ -1624,7 +1650,7 @@ struct VECTOR_SHA_V128
     if (i.src2.is_constant) {
       const auto& shamt = i.src2.constant();
       bool all_same = true;
-      for (size_t n = 0; n < 8 - n; ++n) {
+      for (size_t n = 0; n < 7; ++n) {
         if (shamt.u16[n] != shamt.u16[n + 1]) {
           all_same = false;
           break;
@@ -1683,7 +1709,7 @@ struct VECTOR_SHA_V128
 
     e.L(looper);
     e.movzx(e.ecx, e.word[e.rsp + stack_offset_src2 + e.rdx]);
-
+    e.and_(e.cl, 0xF);  // Mask shift count to 4 bits (0-15) for word shifts
     e.sar(e.word[e.rsp + stack_offset_src1 + e.rdx], e.cl);
 
     e.add(e.edx, 2);
@@ -1699,7 +1725,7 @@ struct VECTOR_SHA_V128
     if (i.src2.is_constant) {
       const auto& shamt = i.src2.constant();
       bool all_same = true;
-      for (size_t n = 0; n < 4 - n; ++n) {
+      for (size_t n = 0; n < 3; ++n) {
         if (shamt.u32[n] != shamt.u32[n + 1]) {
           all_same = false;
           break;
@@ -1767,6 +1793,7 @@ struct VECTOR_SHA_V128
 
       e.L(looper);
       e.mov(e.ecx, e.dword[e.rsp + stack_offset_src2 + e.rdx]);
+      e.and_(e.cl, 0x1F);  // Mask shift count to 5 bits (0-31) for dword shifts
       e.sar(e.dword[e.rsp + stack_offset_src1 + e.rdx], e.cl);
 
       e.add(e.edx, 4);
@@ -2587,7 +2614,16 @@ static void emit_fast_f16_unpack(X64Emitter& e, const Inst& i,
 template <typename Inst>
 static void emit_fast_f16_pack(X64Emitter& e, const Inst& i,
                                XmmConst final_shuffle) {
+  // XMMF16PackLCPI0 includes bias (0x08000000) + round-half-down (0xFFF).
+  // For round-to-nearest-even, also add the tie-breaker: bit 13 of src.
+  // Bit 13 of (src + bias) == bit 13 of src since the bias doesn't affect
+  // bits 0-26.
   e.vpaddd(e.xmm1, i.src1, e.GetXmmConstPtr(XMMF16PackLCPI0));
+  e.vpsrld(e.xmm0, i.src1, 13);
+  e.vpslld(e.xmm0, e.xmm0, 31);
+  e.vpsrld(e.xmm0, e.xmm0, 31);
+  e.vpaddd(e.xmm1, e.xmm1, e.xmm0);
+
   e.vpand(e.xmm2, i.src1, e.GetXmmConstPtr(XMMAbsMaskPS));
   e.vmovdqa(e.xmm3, e.GetXmmConstPtr(XMMF16PackLCPI2));
 
@@ -2722,23 +2758,60 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
     // http://blogs.msdn.com/b/chuckw/archive/2012/09/11/directxmath-f16c-and-fma.aspx
     // dest = [(src1.x | src1.y), 0, 0, 0]
 
-    if (i.src1.is_constant) {
-      e.lea(e.GetNativeParam(0), e.StashConstantXmm(0, i.src1.constant()));
-    } else {
-      e.lea(e.GetNativeParam(0), e.StashXmm(0, i.src1));
-    }
+    auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+
+#if XE_PLATFORM_WIN32
+    // Windows x64 ABI: __m128 is passed by implicit pointer
+    e.lea(e.GetNativeParam(0), e.StashXmm(0, src1));
+#else
+    // Linux/Mac System V ABI: __m128 passed in xmm0, return in xmm0
+    e.vmovaps(e.xmm0, src1);
+#endif
     e.CallNativeSafe(reinterpret_cast<void*>(EmulateFLOAT16_2));
     e.vmovaps(i.dest, e.xmm0);
   }
 
+  static __m128i EmulateFLOAT16_4_RoundToEven(void*, __m128 src1) {
+    alignas(16) uint16_t b[8] = {0};
+
+    // Extract and convert all 4 floats
+    float f0 = _mm_cvtss_f32(src1);
+    float f1 =
+        _mm_cvtss_f32(_mm_shuffle_ps(src1, src1, _MM_SHUFFLE(1, 1, 1, 1)));
+    float f2 =
+        _mm_cvtss_f32(_mm_shuffle_ps(src1, src1, _MM_SHUFFLE(2, 2, 2, 2)));
+    float f3 =
+        _mm_cvtss_f32(_mm_shuffle_ps(src1, src1, _MM_SHUFFLE(3, 3, 3, 3)));
+
+    // Convert to float16 with round-to-nearest-even
+    // Index calculation: 7 - (i ^ 2) where ^ is XOR
+    b[5] = float_to_xenos_half(f0, false, true);  // 7 - (0 ^ 2) = 7 - 2 = 5
+    b[4] = float_to_xenos_half(f1, false, true);  // 7 - (1 ^ 2) = 7 - 3 = 4
+    b[7] = float_to_xenos_half(f2, false, true);  // 7 - (2 ^ 2) = 7 - 0 = 7
+    b[6] = float_to_xenos_half(f3, false, true);  // 7 - (3 ^ 2) = 7 - 1 = 6
+
+    return _mm_load_si128(reinterpret_cast<const __m128i*>(b));
+  }
+
   static void EmitFLOAT16_4(X64Emitter& e, const EmitArgType& i) {
     if (!i.src1.is_constant) {
+#if XE_ARCH_AMD64
       emit_fast_f16_pack(e, i, XMMPackFLOAT16_4);
+#else
+      auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+#if XE_PLATFORM_WIN32
+      e.lea(e.GetNativeParam(0), e.StashXmm(0, src1));
+#else
+      e.vmovaps(e.xmm0, src1);
+#endif
+      e.CallNativeSafe(reinterpret_cast<void*>(EmulateFLOAT16_4_RoundToEven));
+      e.vmovdqa(i.dest, e.xmm0);
+#endif
     } else {
       vec128_t result = vec128b(0);
       for (unsigned idx = 0; idx < 4; ++idx) {
         result.u16[(7 - (idx ^ 2))] =
-            float_to_xenos_half(i.src1.constant().f32[idx]);
+            float_to_xenos_half(i.src1.constant().f32[idx], false, true);
       }
 
       e.LoadConstantXmm(i.dest, result);
@@ -2867,26 +2940,36 @@ struct PACK : Sequence<PACK, I<OPCODE_PACK, V128Op, V128Op, V128Op>> {
       if (IsPackOutUnsigned(flags)) {
         if (IsPackOutSaturate(flags)) {
           // unsigned -> unsigned + saturate
-          if (i.src1.is_constant) {
-            e.lea(e.GetNativeParam(0),
-                  e.StashConstantXmm(0, i.src1.constant()));
-          } else {
-            e.lea(e.GetNativeParam(0), e.StashXmm(0, i.src1));
-          }
-          if (i.src2.is_constant) {
-            e.lea(e.GetNativeParam(1),
-                  e.StashConstantXmm(1, i.src2.constant()));
-          } else {
-            e.lea(e.GetNativeParam(1), e.StashXmm(1, i.src2));
-          }
+          auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+          auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm4);
+
+#if XE_PLATFORM_WIN32
+          // Windows x64 ABI: __m128i is passed by implicit pointer
+          e.lea(e.GetNativeParam(0), e.StashXmm(0, src1));
+          e.lea(e.GetNativeParam(1), e.StashXmm(1, src2));
+#else
+          // Linux/Mac System V ABI: __m128i passed in xmm0/xmm1, return in xmm0
+          e.vmovaps(e.xmm0, src1);
+          e.vmovaps(e.xmm1, src2);
+#endif
           e.CallNativeSafe(
               reinterpret_cast<void*>(EmulatePack8_IN_16_UN_UN_SAT));
           e.vmovaps(i.dest, e.xmm0);
           e.vpshufb(i.dest, i.dest, e.GetXmmConstPtr(XMMByteOrderMask));
         } else {
           // unsigned -> unsigned
-          e.lea(e.GetNativeParam(1), e.StashXmm(1, i.src2));
-          e.lea(e.GetNativeParam(0), e.StashXmm(0, i.src1));
+          auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+          auto src2 = GetInputRegOrConstant(e, i.src2, e.xmm4);
+
+#if XE_PLATFORM_WIN32
+          // Windows x64 ABI: __m128i is passed by implicit pointer
+          e.lea(e.GetNativeParam(0), e.StashXmm(0, src1));
+          e.lea(e.GetNativeParam(1), e.StashXmm(1, src2));
+#else
+          // Linux/Mac System V ABI: __m128i passed in xmm0/xmm1, return in xmm0
+          e.vmovaps(e.xmm0, src1);
+          e.vmovaps(e.xmm1, src2);
+#endif
           e.CallNativeSafe(reinterpret_cast<void*>(EmulatePack8_IN_16_UN_UN));
           e.vmovaps(i.dest, e.xmm0);
           e.vpshufb(i.dest, i.dest, e.GetXmmConstPtr(XMMByteOrderMask));
@@ -3121,11 +3204,15 @@ struct UNPACK : Sequence<UNPACK, I<OPCODE_UNPACK, V128Op, V128Op>> {
     // Also zero out the high end.
     // TODO(benvanik): special case constant unpacks that just get 0/1/etc.
 
-    if (i.src1.is_constant) {
-      e.lea(e.GetNativeParam(0), e.StashConstantXmm(0, i.src1.constant()));
-    } else {
-      e.lea(e.GetNativeParam(0), e.StashXmm(0, i.src1));
-    }
+    auto src1 = GetInputRegOrConstant(e, i.src1, e.xmm3);
+
+#if XE_PLATFORM_WIN32
+    // Windows x64 ABI: __m128i is passed by implicit pointer
+    e.lea(e.GetNativeParam(0), e.StashXmm(0, src1));
+#else
+    // Linux/Mac System V ABI: __m128i passed in xmm0, return in xmm0
+    e.vmovaps(e.xmm0, src1);
+#endif
     e.CallNativeSafe(reinterpret_cast<void*>(EmulateFLOAT16_2));
     e.vmovaps(i.dest, e.xmm0);
   }

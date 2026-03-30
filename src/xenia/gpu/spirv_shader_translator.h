@@ -34,7 +34,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // TODO(Triang3l): Change to 0xYYYYMMDD once it's out of the rapid
     // prototyping stage (easier to do small granular updates with an
     // incremental counter).
-    static constexpr uint32_t kVersion = 6;
+    static constexpr uint32_t kVersion = 8;
 
     enum class DepthStencilMode : uint32_t {
       kNoModifiers,
@@ -60,6 +60,11 @@ class SpirvShaderTranslator : public ShaderTranslator {
       // Pipeline stage and input configuration.
       Shader::HostVertexShaderType host_vertex_shader_type
           : Shader::kHostVertexShaderTypeBitCount;
+      // User clip plane count, number of clip planes enabled (0-6).
+      uint32_t user_clip_plane_count : 3;
+      // If user_clip_plane_count is non-zero, whether they should be cull
+      // distances instead of clip distances.
+      uint32_t user_clip_plane_cull : 1;
     } vertex;
     struct PixelShaderModification {
       // uint32_t 0.
@@ -78,6 +83,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
       uint32_t param_gen_point : 1;
       // For host render targets - depth / stencil output mode.
       DepthStencilMode depth_stencil_mode : 3;
+      // For host render targets with MIN/MAX blend op - the source blend factor
+      // to pre-multiply the shader output by (since Vulkan/D3D12 MIN/MAX
+      // ignores blend factors, but Xbox 360 applies them). kOne means no
+      // pre-multiply. Only RT0 is supported for now.
+      xenos::BlendFactor rt0_blend_rgb_factor_for_premult : 5;
+      xenos::BlendFactor rt0_blend_a_factor_for_premult : 5;
     } pixel;
     uint64_t value = 0;
 
@@ -202,10 +213,17 @@ class SpirvShaderTranslator : public ShaderTranslator {
     // swizzles for 2 texture fetch constants (in bits 0:11 and 12:23).
     uint32_t texture_swizzles[16];
 
+    // Whether the contents of each texture in fetch constants comes from a
+    // resolve operation (bit per texture, 32 textures max).
+    uint32_t textures_resolved;
+
     float alpha_test_reference;
     uint32_t edram_32bpp_tile_pitch_dwords_scaled;
     uint32_t edram_depth_base_dwords_scaled;
-    float padding_edram_depth_base_dwords_scaled;
+    // If alpha to mask is disabled, the entire alpha_to_mask value must be 0.
+    // If alpha to mask is enabled, bits 0:7 are sample offsets, and bit 8 must
+    // be 1.
+    uint32_t alpha_to_mask;
 
     float color_exp_bias[4];
 
@@ -254,12 +272,34 @@ class SpirvShaderTranslator : public ShaderTranslator {
     float edram_blend_constant[4];
   };
 
+  // Separate constant buffer for user clip planes
+  struct ClipPlaneConstants {
+    float user_clip_planes[6][4];
+  };
+
+  // Separate constant buffer for tessellation parameters.
+  // Must match the layout in xenos_draw.glsli (std140).
+  struct TessellationConstants {
+    // Tessellation factor range: [0] = min, [1] = max.
+    // 1.0 is added on the CPU according to Xbox 360 tessellation documentation.
+    // For fractional_even partitioning, minimum factor must be >= 2.0.
+    float tessellation_factor_range[2];
+    // Padding to align next member to 8 bytes (std140 rules).
+    float padding0[2];
+    // Vertex/index processing parameters.
+    uint32_t vertex_index_endian;
+    uint32_t vertex_index_offset;
+    uint32_t vertex_index_min_max[2];
+  };
+
   enum ConstantBuffer : uint32_t {
     kConstantBufferSystem,
     kConstantBufferFloatVertex,
     kConstantBufferFloatPixel,
     kConstantBufferBoolLoop,
     kConstantBufferFetch,
+    kConstantBufferClipPlanes,
+    kConstantBufferTessellation,
 
     kConstantBufferCount,
   };
@@ -681,6 +721,16 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // flow because of taking derivatives of the fragment depth.
   void FSI_DepthStencilTest(spv::Id msaa_samples,
                             bool sample_mask_potentially_narrowed_previouly);
+
+  // Alpha to coverage helper - tests one sample.
+  // coverage_out is modified to include this sample if it passes.
+  void FSI_AlphaToMaskSample(bool initialize, uint32_t sample_index,
+                             float threshold_base, spv::Id threshold_offset,
+                             float threshold_offset_scale, spv::Id alpha,
+                             spv::Id& coverage_out);
+
+  // Alpha to coverage main function.
+  void FSI_AlphaToMask();
   // Returns the first and the second 32 bits as two uints.
   std::array<spv::Id, 2> FSI_ClampAndPackColor(spv::Id color_float4,
                                                spv::Id format_with_flags);
@@ -726,7 +776,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
   // flow of the main function, and that there are no returns before either
   // (there's a single return from the shader).
   bool edram_fragment_shader_interlock_;
-
+  // Whether with host render targets, k_8_8_8_8_GAMMA render targets are
   // Is currently writing the empty depth-only pixel shader, such as for depth
   // and stencil testing with fragment shader interlock.
   bool is_depth_only_fragment_shader_ = false;
@@ -821,7 +871,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantPointScreenDiameterToNdcRadius,
     kSystemConstantTextureSwizzledSigns,
     kSystemConstantTextureSwizzles,
+    kSystemConstantTexturesResolved,
     kSystemConstantAlphaTestReference,
+    kSystemConstantAlphaToMask,
     kSystemConstantEdram32bppTilePitchDwordsScaled,
     kSystemConstantEdramDepthBaseDwordsScaled,
     kSystemConstantColorExpBias,
@@ -841,6 +893,7 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kSystemConstantEdramBlendConstant,
   };
   spv::Id uniform_system_constants_;
+  spv::Id uniform_clip_plane_constants_;
   spv::Id uniform_float_constants_;
   spv::Id uniform_bool_loop_constants_;
   spv::Id uniform_fetch_constants_;
@@ -859,6 +912,8 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id input_vertex_index_;
   // VS as TES only - int.
   spv::Id input_primitive_id_;
+  // VS as TES only - float3 (barycentric coordinates).
+  spv::Id input_tess_coord_;
   // PS, only when needed - float2.
   spv::Id input_point_coordinates_;
   // PS, only when needed - float4.
@@ -890,11 +945,30 @@ class SpirvShaderTranslator : public ShaderTranslator {
     kOutputPerVertexMemberCount,
   };
   spv::Id output_per_vertex_;
+  unsigned int output_per_vertex_clip_distance_member_index_ = 0;
+  unsigned int output_per_vertex_cull_distance_member_index_ = 0;
 
-  // With fragment shader interlock, variables in the main function.
-  // Otherwise, framebuffer color attachment outputs.
+  // Function-scoped variables for fragment color data.
+  // Used by both FSI and FBO paths so that color values can be read back
+  // (e.g., for alpha test). For FBO, these are copied to output_fragment_data_
+  // at the end of the shader.
   std::array<spv::Id, xenos::kMaxColorRenderTargets>
       output_or_var_fragment_data_;
+
+  // FBO only: Actual framebuffer color attachment outputs (Output storage).
+  // These are write-only and populated at the end of the shader from
+  // output_or_var_fragment_data_.
+  std::array<spv::Id, xenos::kMaxColorRenderTargets> output_fragment_data_;
+
+  // Fragment shader depth output (gl_FragDepth).
+  // With fragment shader interlock, a variable in the main function.
+  // Otherwise, the depth output (only created if shader writes depth).
+  spv::Id output_or_var_fragment_depth_;
+
+  // Fragment shader sample mask output (gl_SampleMask).
+  // Only used for alpha-to-coverage in non-FSI mode.
+  // For FSI mode, sample mask is handled via main_fsi_sample_mask_.
+  spv::Id output_fragment_sample_mask_;
 
   std::vector<spv::Id> main_interface_;
   spv::Function* function_main_;
@@ -938,11 +1012,12 @@ class SpirvShaderTranslator : public ShaderTranslator {
   spv::Id var_main_point_size_edge_flag_kill_vertex_;
   // PS, only when needed - bool.
   spv::Id var_main_kill_pixel_;
-  // PS, only when writing to color render targets with fragment shader
-  // interlock - uint.
+  // PS, when writing to color render targets - uint.
   // Whether color buffers have been written to, if not written on the taken
   // execution path, don't export according to Direct3D 9 register documentation
   // (some games rely on this behavior).
+  // Used by both FSI and FBO paths for proper alpha test / alpha-to-coverage
+  // behavior.
   spv::Id var_main_fsi_color_written_;
   // Loaded by FSI_LoadSampleMask.
   // Can be modified on the outermost control flow level in the main function.

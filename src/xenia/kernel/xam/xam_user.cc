@@ -88,8 +88,6 @@ dword_result_t XamUserGetIndexFromXUID_entry(qword_t xuid, dword_t flags,
 DECLARE_XAM_EXPORT1(XamUserGetIndexFromXUID, kUserProfiles, kImplemented);
 
 dword_result_t XamUserGetSigninState_entry(dword_t user_index) {
-  // Yield, as some games spam this.
-  xe::threading::MaybeYield();
   uint32_t signin_state = 0;
   if (user_index >= XUserMaxUserCount) {
     return signin_state;
@@ -356,6 +354,8 @@ dword_result_t XamUserWriteProfileSettings_entry(
   }
 
   auto run = [=](uint32_t& extended_error, uint32_t& length) {
+    bool was_avatar_setting_changed = false;
+    const uint8_t user_index_bit = (1 << user_index) & 0xF;
     // Update and save settings.
     const auto& user_profile =
         kernel_state()->xam_state()->GetUserProfile(user_index);
@@ -369,6 +369,11 @@ dword_result_t XamUserWriteProfileSettings_entry(
 
     for (uint32_t n = 0; n < setting_count; ++n) {
       const UserSetting setting = UserSetting(&settings[n]);
+      if (setting.get_setting_id() ==
+          static_cast<uint32_t>(
+              UserSettingId::XPROFILE_GAMERCARD_AVATAR_INFO_1)) {
+        was_avatar_setting_changed = true;
+      }
 
       if (!setting.is_valid_type()) {
         continue;
@@ -376,6 +381,13 @@ dword_result_t XamUserWriteProfileSettings_entry(
 
       kernel_state()->xam_state()->user_tracker()->UpsertSetting(
           user_profile->xuid(), title_id, &setting);
+    }
+
+    kernel_state()->BroadcastNotification(
+        kXNotificationSystemProfileSettingChanged, user_index_bit);
+    if (was_avatar_setting_changed) {
+      kernel_state()->BroadcastNotification(kXNotificationSystemAvatarChanged,
+                                            user_index_bit);
     }
 
     extended_error = X_HRESULT_FROM_WIN32(X_STATUS_SUCCESS);
@@ -395,15 +407,30 @@ DECLARE_XAM_EXPORT1(XamUserWriteProfileSettings, kUserProfiles, kImplemented);
 
 dword_result_t XamUserCheckPrivilege_entry(dword_t user_index, dword_t mask,
                                            lpdword_t out_value) {
-  // checking all users?
-  if (user_index != XUserIndexAny) {
-    if (user_index >= XUserMaxUserCount) {
-      return X_ERROR_INVALID_PARAMETER;
+  if (user_index == XUserIndexAny) {
+    for (uint8_t i = 0; i < XUserMaxUserCount; ++i) {
+      const auto result = XamUserCheckPrivilege_entry(i, mask, out_value);
+      if (result != X_ERROR_NO_SUCH_USER) {
+        *out_value = 0;
+        return result;
+      }
     }
+    *out_value = 0;
+    return X_ERROR_NO_SUCH_USER;
+  }
 
-    if (!kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
-      return X_ERROR_NO_SUCH_USER;
-    }
+  if (user_index >= XUserMaxUserCount) {
+    return X_ERROR_INVALID_PARAMETER;
+  }
+
+  if (!kernel_state()->xam_state()->IsUserSignedIn(user_index)) {
+    return X_ERROR_NO_SUCH_USER;
+  }
+
+  if (kernel_state()->xam_state()->GetUserProfile(user_index)->signin_state() !=
+      static_cast<uint32_t>(SignInState::SignedInToLive)) {
+    *out_value = 0;
+    return X_ERROR_NOT_LOGGED_ON;
   }
 
   // If we deny everything, games should hopefully not try to do stuff.
